@@ -1,0 +1,148 @@
+import speechbrain as sb
+import numpy as np
+import torch
+import torchaudio
+import glob
+import os
+from speechbrain.dataio.batch import PaddedBatch
+from tqdm import tqdm
+import warnings
+import pyloudnorm
+import random
+import itertools
+from scipy.signal import resample_poly
+from RAVDESS2Mix_BSS_prep import getEmotion, getIntensity
+
+def dataio_prep(hparams):
+    
+    emotion_list = [*range(1,9)]
+    emotion_combs = [*itertools.product(emotion_list,emotion_list)]
+    normal_emotions_list = [getEmotion(x[0])+"_"+getEmotion(x[1]) for x in emotion_combs]
+    
+    emotion_list = [*range(2,9)]
+    emotion_combs = [*itertools.product(emotion_list,emotion_list)]
+    strong_emotions_list = [getEmotion(x[0])+"_"+getEmotion(x[1]) for x in emotion_combs]
+
+    # 1. Define datasets
+    normal_data = []
+    for emotion in normal_emotions_list:
+        normal_data.append(
+            sb.dataio.dataset.DynamicItemDataset.from_csv(
+                csv_path=f'{hparams["save_folder"]}normal_normal/{emotion}.csv',                    
+                )
+            )
+    strong_data = []
+    for emotion in normal_emotions_list:
+        normal_data.append(
+            sb.dataio.dataset.DynamicItemDataset.from_csv(
+                csv_path=f'{hparams["save_folder"]}normal_normal/{emotion}.csv',                    
+                )
+            )
+    @sb.utils.data_pipeline.takes("s1_wav","s2_wav")
+    @sb.utils.data_pipeline.provides("mix_sig","s1_sig","s2_sig")
+    def audio_pipeline_mix(s1_wav, s2_wav):
+        """
+        This audio pipeline defines the compute graph for dynamic mixing of the RAVDESS2Mix dataset
+        Based on the original RAVDES2Mix mixing script, we downsample the audio before normalization 
+        Function used is scipy.signal.resample_poly
+        
+        """
+
+        sources = []
+        spk_files = [s1_wav,s2_wav]
+
+
+        minlen = min(
+            *[torchaudio.info(x).num_frames for x in spk_files],
+        )
+        
+        meter = pyloudnorm.Meter(hparams["sample_rate"])
+
+        MAX_AMP = 0.9
+        MIN_LOUDNESS = -33
+        MAX_LOUDNESS = -25
+
+        def normalize(signal, is_noise=False):
+            """
+            This function normalizes the audio signals for loudness
+            """
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                c_loudness = meter.integrated_loudness(signal)
+                if is_noise:
+                    target_loudness = random.uniform(
+                        MIN_LOUDNESS - 5, MAX_LOUDNESS - 5
+                    )
+                else:
+                    target_loudness = random.uniform(MIN_LOUDNESS, MAX_LOUDNESS)
+                signal = pyloudnorm.normalize.loudness(
+                    signal, c_loudness, target_loudness
+                )
+
+                # check for clipping
+                if np.max(np.abs(signal)) >= 1:
+                    signal = signal * MAX_AMP / np.max(np.abs(signal))
+
+            return torch.from_numpy(signal)
+
+        for i, spk_file in enumerate(spk_files):
+            # select random offset
+            length = torchaudio.info(spk_file).num_frames
+            start = 0
+            stop = length
+            if length > minlen:  # take a random window
+                start = np.random.randint(0, length - minlen)
+                stop = start + minlen
+
+            tmp, fs_read = torchaudio.load(
+                spk_file, frame_offset=start, num_frames=stop - start,
+            )
+            tmp = tmp[0].numpy()
+            tmp = resample_poly(tmp,hparams["sample_rate"],fs_read)
+            tmp = normalize(tmp)
+            sources.append(tmp)
+
+        sources = torch.stack(sources)
+        mixture = torch.sum(sources, 0)
+
+        # check for clipping
+        max_amp_insig = mixture.abs().max().item()
+        if max_amp_insig > MAX_AMP:
+            weight = MAX_AMP / max_amp_insig
+        else:
+            weight = 1
+
+        sources = weight * sources
+        mix_sig = weight * mixture
+
+        yield mix_sig
+        for i in range(hparams["num_spks"]):
+            yield sources[i]
+        
+    sb.dataio.dataset.add_dynamic_item(normal_data, audio_pipeline_mix)
+    # sb.dataio.dataset.add_dynamic_item(normal_data, audio_pipeline_s1)
+    # sb.dataio.dataset.add_dynamic_item(normal_data, audio_pipeline_s2)
+    sb.dataio.dataset.set_output_keys(
+        normal_data, ["id", "mix_sig", "s1_sig", "s2_sig"]
+    )
+    # if "strong_emotions_list" in hparams:
+    #     sb.dataio.dataset.add_dynamic_item(strong_data, audio_pipeline_mix)
+    #     sb.dataio.dataset.add_dynamic_item(strong_data, audio_pipeline_s1)
+    #     sb.dataio.dataset.add_dynamic_item(strong_data, audio_pipeline_s2)
+    #     sb.dataio.dataset.set_output_keys(
+    #         strong_data, ["id", "mix_sig", "s1_sig", "s2_sig"]
+    #     )
+        
+    return normal_data
+
+if __name__ == "__main__":
+    hparams={
+        "normal_emotions_list": [1,2,3],
+        "num_spks":2,
+        "sample_rate":8000,
+        "limit_training_signal_len": False,
+        "training_signal_len": None,
+        "save_folder": "RAVDESS2Mix_csv/sep_third_spks/"
+    }
+    test = dataio_prep(hparams)
+    print(test[0][0].keys())
